@@ -1,0 +1,206 @@
+#!/bin/bash
+
+# Copyright (c) 2023, Hopsworks and/or its affiliates.
+# Written by Axel Svensson <axel@hopsworks.ai>
+# Distributed under the GNU General Public License, version 2.0.
+
+# In part inspired by git-reparent which is distributed under the GNU General
+# Public License, version 2.0. See https://github.com/MarkLodato/git-reparent
+
+set -e -o pipefail
+
+# shellcheck disable=SC2034
+OPTIONS_SPEC="\
+git nullmerge [OPTIONS] <commit>
+
+Perform null merges in preparation to merge with <commit>.
+--
+h               show the help
+b,batch         commit without editing the commit message in an editor
+d,dry-run       show the commit, but do not move HEAD
+"
+# shellcheck disable=SC2034
+SUBDIRECTORY_OK=Yes
+# shellcheck disable=SC1091
+. "$(git --exec-path)/git-sh-setup"
+require_clean_work_tree nullmerge "Please commit or stash them first."
+
+die_with_usage() {
+	echo "error: $1" >&2
+	usage
+}
+
+die_ok() {
+    die_with_status 0 "$@"
+}
+
+bug() {
+    die "git-nullmerge: Bug on line $1"
+}
+
+# Wrapper around grep that returns 0 if there is no error, even if there is no match.
+x_grep() {
+    if grep "$@"; then
+        return 0
+    else
+        if [ "$?" -eq 1 ]; then
+            return 0 # No match
+        fi
+        return "$?" # Error
+    fi
+}
+
+# Show a commit on one line
+showcommit() {
+    git show --no-notes --no-patch --pretty='%h %s' "$1" > "$d/show"
+    sed -ri '/^$/d' "$d/show"
+    cat "$d/show"
+}
+
+# Process arguments
+batch=
+dry=
+while [ $# -gt 0 ]; do
+	  case "$1" in
+        -h)           usage ;;
+	      -b|--batch)   batch=1 ;;
+        -d|--dry-run) dry=1 ;;
+	      --)           shift; break ;;
+	      *)            die "Unknown flag $1" ;;
+	  esac
+	  shift
+done
+[ $# -ne 1 ] && \
+	die_with_usage "expected exactly one <commit>"
+
+our=$(git rev-parse --verify "HEAD^{commit}")
+our_tree=$(git rev-parse --verify "HEAD^{tree}")
+their=$(git rev-parse --verify "$1^{commit}")
+[ "$our" == "$their" ] && die_ok "Merge target is the same as HEAD, refusing to attempt a null merge."
+git merge-base --is-ancestor "$our" "$their" && die_ok "Merge target would be a fast-forward merge, refusing to attempt a null merge."
+git merge-base --is-ancestor "$their" "$our" && die_ok "Merge target is an ancestor of HEAD, refusing to attempt a null merge."
+
+d=$(mktemp -d -t git-nullmerge.XXXXXX)
+# shellcheck disable=SC2064
+trap "rm -rf $d" EXIT
+
+# Get a list of commits in our history that are not in theirs, formatted with tree hash first, then commit hash.
+git log --date-order --pretty=tformat:'%T %H' "$their..$our" > "$d/ours"
+# Vice versa.
+git log --date-order --pretty=tformat:'%T %H' "$our..$their" > "$d/theirs"
+# Find commits with identical trees.
+sort "$d/ours" > "$d/ours.sorted"
+sort "$d/theirs" > "$d/theirs.sorted"
+join "$d/ours.sorted" "$d/theirs.sorted" > "$d/identical"
+cut '-d ' -f2 "$d/identical" > "$d/identical.commits.ours"
+cut '-d ' -f3 "$d/identical" > "$d/identical.commits.theirs"
+sed -ri 's/^/ /' "$d/identical.commits.ours" "$d/identical.commits.theirs"
+x_grep -Ff "$d/identical.commits.ours" "$d/ours" > "$d/ours.identical"
+x_grep -Ff "$d/identical.commits.theirs" "$d/theirs" > "$d/theirs.identical"
+if [ -s "$d/ours.identical" ] && [ -s "$d/theirs.identical" ]; then :
+else die_ok "No null merge possible."
+fi
+# Find the latest commit on their side that has an identical tree to some commit on our side.
+their_first_identical=$(sed '2,$d' "$d/theirs.identical")
+their_first_identical_commit=$(cut '-d ' -f2 <<< "$their_first_identical")
+their_first_identical_tree=$(cut '-d ' -f1 <<< "$their_first_identical")
+# Find the latest commit on our side that has an identical tree to their commit found above.
+our_identical=$(grep -m 1 -F "$their_first_identical_tree " "$d/ours.identical")
+our_identical_commit=$(cut '-d ' -f2 <<< "$our_identical")
+# Find base
+base=""
+if git merge-base "$our_identical_commit" "$their_first_identical_commit" > "$d/base";
+then
+    base=$(cat "$d/base")
+    [ -n "$base" ] || bug $LINENO
+else
+    if [ "$?" -eq 1 ];
+    then : # No merge base
+    else die "git merge-base failed with error $?"
+    fi
+fi
+
+# Test assumptions
+our_identical_tree=$(cut '-d ' -f1 <<< "$our_identical")
+[ "$our_identical_tree" = "$their_first_identical_tree" ] || bug $LINENO
+our_identical_tree_git=$(git rev-parse --verify "$our_identical_commit^{tree}")
+[ "$our_identical_tree_git" = "$our_identical_tree" ] || bug $LINENO
+their_first_identical_tree_git=$(git rev-parse --verify "$their_first_identical_commit^{tree}")
+[ "$their_first_identical_tree_git" = "$their_first_identical_tree" ] || bug $LINENO
+git merge-base --is-ancestor "$our_identical_commit" "$our" || bug $LINENO
+git merge-base --is-ancestor "$their_first_identical_commit" "$their" || bug $LINENO
+
+# Create commit message
+if [ -n "$batch" ]; then
+    msg_file="$d/msg"
+else
+    msg_file="$GIT_DIR/MERGE_MSG"
+fi
+{
+    dots=$(git rev-parse --short HEAD | sed -r 's/././g')
+    prcc() {
+        local count
+        if [ -n "$2" ]; then
+            count="$(git log --oneline --pretty=tformat:'%H' "$2..$3"| wc -l)"
+        else
+            count="$(git log --oneline --pretty=tformat:'%H' "$3"| wc -l)"
+        fi
+        [ "$count" -ge 1 ] || bug $LINENO
+        if [ "$count" -gt 1 ]; then
+            local s
+            [ "$count" -eq 2 ] && s="" || s="s"
+            echo "$1 $dots ($((count - 1)) commit$s)"
+        fi
+    }
+    echo "Null merge"
+    echo
+    echo "This is a null merge of THEIR into OUR, meaning OUR and MERGE have"
+    if [ "$our" == "$our_identical_commit" ]; then
+    echo "identical trees. This is justified by the fact that THEIR has an"
+    echo "identical tree to OUR (and MERGE)."
+    else
+    echo "identical trees. This is justified by the fact that THEIR and IDENTICAL"
+    echo "have identical trees, and that IDENTICAL is an ancestor to OUR."
+    fi
+    echo
+    echo "MERGE:     *   $dots Null merge"
+    echo "           |\\"
+    echo "OUR:       * | $(showcommit "$our")"
+    if [ "$our" != "$our_identical_commit" ]; then
+    prcc "           * |" "$our_identical_commit" "$our"
+    echo "IDENTICAL: * | $(showcommit "$our_identical_commit")"
+    fi
+    if [ -z "$base" ]; then
+    prcc "           * |" "" "$our_identical_commit"
+    echo "THEIR:       * $(showcommit "$their_first_identical_commit")"
+    prcc "             *" "" "$their_first_identical_commit"
+    else
+    prcc "           * |" "$base" "$our_identical_commit"
+    echo "THEIR:     | * $(showcommit "$their_first_identical_commit")"
+    prcc "           | *" "$base" "$their_first_identical_commit"
+    echo "           |/"
+    echo "BASE:      *   $(showcommit "$base")"
+    prcc "           *  " "" "$base"
+    fi
+} > "$msg_file"
+
+# Edit commit message
+if [ -z "$batch" ]; then
+	git_editor "$msg_file" || die "error in git_editor"
+	[ -s "$msg_file" ] || die "aborting due to empty commit message"
+fi
+
+# Create null merge commit
+null_merge="$(git commit-tree "$our_tree" -p "$our" -p "$their_first_identical_commit" -F "$msg_file")"
+
+if [ -n "$dry" ]; then
+    # Show null merge without updating HEAD.
+    echo "Created null merge without updating HEAD"
+    git show --no-patch "$null_merge"
+else
+    # Update HEAD.
+    set_reflog_action nullmerge
+    git reset "$null_merge"
+    echo "Created null merge and updated HEAD to: $(showcommit "$null_merge")"
+    echo "Run again in case another null merge is possible."
+fi
